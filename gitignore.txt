@@ -1,0 +1,33 @@
+.claude/
+AGENTS.local.md
+CLAUDE.local.md
+publish.sh
+skills/cluster-health/protected/
+skills/kubernetes-health/protected/
+/private-patterns.txt
+docs/local/
+SECURITY-AUDIT.md
+.codex
+.commandcode/
+.env
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+.yarnrc
+.yarnrc.yml
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.refiner-baseline.json
+test.sh
+
+# Disposable agent handoff docs
+.handoff/
+
+# Disposable improve-skill audit plans
+plans/
+
+# Superpowers brainstorm scratch (local only)
+.superpowers/
