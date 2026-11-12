@@ -161,6 +161,8 @@ globalThis.__plan = roots.map(r => {                    // 挂 globalThis：跨�
     unrecorded: inside.filter(id => !L.folders[id]).length,          // >0 ⇒ 必须 processTree
     doneInside: inside.filter(id => L.vDone[id] && L.vDone[id].done).length };
 });
+// 计划落独立 JSON：kernel 回收后直接读回，不必重跑枚举与差集（__plan 只是内存缓存）
+fs.writeFileSync('<台账目录>/plan-<年份>-<日期>.json', JSON.stringify({ at: new Date().toISOString(), root: ROOT, missing: missing, plan: globalThis.__plan }));
 nodeRepl.write(JSON.stringify({ missingSnapshot: (tr.missing || []).length, missingNow: missing.length,
   roots: globalThis.__plan.length, plan: globalThis.__plan.slice(0, 5) }));
 ```
@@ -184,25 +186,21 @@ nodeRepl.write(JSON.stringify({ missingSnapshot: (tr.missing || []).length, miss
 而其中 108 个在之后的轮次里已建档并完成。直接照旧清单跑就是白跑。重算只要一行：
 `let missing = (tr.missing || []).filter(id => !L.folders[id]);`（`errs` 非空时先解决接口问题，别拿半截清单当全树）。
 
-**多根跨格游标**（`timeout_ms: 600000`，每格原样重发这一份；`paused` 就立刻收尾，同 turn 紧接下一格，绝不原地 while 重试）：
+**多根跨格游标：装载 `scripts/gap_runner.mjs`，别手贴循环**（`timeout_ms: 600000`，每格原样重发这一份）：
 
 ```js
-let H = globalThis.__H, L = globalThis.__LED, plan = globalThis.__plan;
-let st = L.treeStack || [];
-// 栈非空 ⇒ 栈底那个根还没跑完，先续它（fresh:false）；栈空 ⇒ 取下一个未完成的根（fresh:true）
-let t = st.length ? plan.find(x => x.id === String(st[0].id))
-                  : plan.find(x => !(L.vDone[x.id] && L.vDone[x.id].done));
-if (!t) { nodeRepl.write(JSON.stringify({ stop: 'all-roots-done', roots: plan.length, folders: Object.keys(L.folders).length })); }
-else {
-  let r = await H.processTree(t.id, { path: t.path, deadline: Date.now() + 550000, fresh: !st.length });
-  nodeRepl.write(JSON.stringify({ root: t.id, r: r, stack: L.treeStack.length,
-    folders: Object.keys(L.folders).length, totSent: L.totSent,
-    rootsLeft: plan.filter(x => !(L.vDone[x.id] && L.vDone[x.id].done)).length }));
-}
+// 前置（新 turn / kernel 回收后跑一次）：__CFG → __bua → 装库 → H.ready() → 从 plan JSON 读回 __plan
+await import('file:///<skill 目录>/scripts/gap_runner.mjs?v=' + Date.now());
+nodeRepl.write(JSON.stringify(await globalThis.__gapRun({
+  plan: globalThis.__plan, log: '<台账目录>/run-gap.jsonl', cellMs: 565000, waitVis: 240000
+})));
 ```
 
-游标就是台账本身（`vDone[root].done` 在 exit 阶段写），不另设进度文件；`__plan` 被 kernel 回收就重跑上面那个 plan cell。
-**栈非空时绝不 `fresh:true`**（会覆盖掉正在跑的那棵树的栈）；一格只推进一个根，`paused` 说明本格时间已耗尽。
+游标语义由 `H.gapNextRoot(plan, L)` 实现，不用自己写：**栈非空 ⇒ 栈底那个根还没跑完，续它 `fresh:false`；栈空 ⇒ 取下一个未完成的根 `fresh:true`**；栈底不在本 plan（属于别的任务）就 `{stop:'stack-other-root'}` 收尾，让归属任务先跑完；**栈底在本 plan 里就续它**（`fresh:false`），哪怕它是计划里的另一个根。游标就是台账本身（`vDone[root].done` 在 exit 阶段写），不另设进度文件。
+**计划要落独立 JSON**（上面那行 `plan-*.json`）：`__plan` 被 kernel 回收就读回它 —— `globalThis.__plan = JSON.parse(fs.readFileSync('<台账目录>/plan-….json','utf8')).plan;`，不必重跑枚举与差集。
+每格日志形状固定 = 每根一行 `{root,…}` + **收尾恰好一行 `{stop,…}`**（任何出口都写；一格可以推进多个根，九种停机原因与处置见 runbooks）。判补跑完成看 `stop:'all-done'` 且 `rootsLeft === 0`；`paused` 立即收尾，同 turn 紧接下一格，**绝不原地 while 重试**。
+**栈非空时绝不 `fresh:true`**（会覆盖掉正在跑的那棵树的栈）。前台闸在 runner 里：页面不可见就 `{stop:'tab-hidden'}` 收尾，**一张都不提交**。
+离线看进度：`node scripts/gap_progress.cjs <run.jsonl> <ledger.json> <plan.json>`（`cells`=已收尾格数、`lines`=日志行数、`perRoot[].cells`=该根被几格碰过）。
 补跑完重跑 Cell 1 对账（差集应归零）+ Cell 2 逐项 HEAD，再按 Cell 5 登记标记。
 
 ---
@@ -295,6 +293,38 @@ nodeRepl.write(JSON.stringify({ ok: r.ok, persist: r.persist, revoked: r.revoked
 
 ---
 
+## 欠账 `needDrain` 的两类处置（别一律重跑，也别一律删）
+
+`needDrain[id] = {total, at, sent, why}` 是「已提交但还没排空完」的欠账。**先分类再动手**：
+
+| 类别 | 怎么认 | 处置 |
+|---|---|---|
+| **① 真欠排空** | `sent > 0` 而 `res2[id].drain` 缺失，或 `drain.reason ∈ {stalled, timeout, not-rendered}`；`res2[id].blocked ∈ {sel-fail, quota, budget, gp-*}` 同样属这类（前面几批已经提交出去了）；`why:'revoke'` 是撤销假标记时补的欠账，也属这类 | **重入该目录补排空**：`processTree` 会自动先走 `tree-redrain-*`；单独补就用 `H.pumpX2(id, budgetMs)` / `H.submitAndDrain(node, total, dl, phase, opts)`。**不要手工删标记** |
+| **② 陈旧标记** | 目录其实早已被证明干净：深度扫 `broken===0` 且 `swept >= 页项数`，或逐项 HEAD 全覆盖且四个 0；标记是「`needDrain` 删除规则」落地**之前**留下的 | **手工销账**（下面的代码），否则汇总永远挂假「待补排空」，日后 `processTree` 重入还要白烧一次 `drainNode` |
+
+实测：2025 收尾格清掉 `2696` / `2702` 两条陈旧欠账（它们在删除规则落地前就被深度扫判干净），清完 `needDrain: []`。
+另一类来源是 cell 被 `node_repl_wait` 打断：无日志行、内存与盘一致、欠账留在 `needDrain` —— 那属**①**，续跑补排空即可。
+
+**销账判据（两类共用）**：证据必须盖住**整目录**。引擎侧是 `H.debtPaid(r, total)`：`r.clean` 且（`win >= total` 整页覆盖、或 `noTiles`、或 `total === 0`）才删；
+**窗口内 clean 不算还债**（7979：82 项、窗口 81、`drain:converted`、`p2.done=1`，窗外第 82 条 HEAD `sm` 实测 404）。
+审计侧的金标准是逐项 HEAD 四个 0（`smBad/xlBad/other/errs` 全空且 `nock===0`）。
+
+```js
+// 只对②手工销账：先拿到该目录的全覆盖证据，再删标记并落盘
+let H = globalThis.__H, L = globalThis.__LED;
+let rep = await globalThis.__headAudit(id, { write: true });   // scripts/head_audit.mjs；整树批量走 Cell 2
+if (rep.ok) {                       // ok = n>0 && nock===0 && smBad/xlBad/other/errs 全空
+  delete L.needDrain[id];           // 证据盖住整目录，债已还
+  await H.persist('debt-clear-' + id);
+} else {
+  // 有缺失/不确定 ⇒ 属①或待修：保留欠账，按 Cell 3 修完再 HEAD 复验，别删
+}
+```
+
+**别做的两件事**：① 看到 `needDrain` 非空就整目录重跑（②类是白烧）；② 看到页面 `bad=0` 就 `delete L.needDrain`（窗口内结论，会固化假干净）。
+
+---
+
 ## 落盘与报告
 
 - **独立 JSON 两份**：`tree-recheck.json`（枚举行 + 差集 + errs）、`recheck.json`（逐目录 `total/smBad/xlBad/nock/videos/other` + 游标 + 累计 agg + 修复与终态）。台账附加字段（如 `recheck2026`）只放汇总与指针，**逐项证据别只挂台账**。
@@ -324,3 +354,8 @@ nodeRepl.write(JSON.stringify({ ok: r.ok, persist: r.persist, revoked: r.revoked
 | 手工建档写 `path` 而不是 `name` | `p2Pass` 的 `node.path` 退化成裸 id（2026 台账 32341–32345 这 5 条就是） |
 | 撤销前不自己留副本 | `force:true` 走的是不写 `.bak` 的分支，撤错了没有上一版可回 |
 | 没 `H.load()` 就撤销 | 返回 `LEDGER_NOT_LOADED`；绕过这道闸则空 `L` + force 把真台账洗成空 |
+| 页面 `bad=0` 就 `delete L.needDrain` | 证据只盖渲染窗口，假干净被固化（7979：82 项 / 窗口 81） |
+| 陈旧 `needDrain` 不销账 | 汇总永远挂假「待补排空」，重入还白烧一次 `drainNode` |
+| 真欠排空（`stalled`/`timeout`/`sel-fail`）手工删标记 | 已提交的图被丢下，永远不转 |
+| `visibilityState=hidden` 时继续提交 | 整批 stalled，每目录白烧 115–180s 还挤占空间配额 |
+| 运行中调 `node_repl_wait` | `CAPABILITY_NOT_NEGOTIATED` 打断 cell，欠账留在 `needDrain`（见 runbooks） |

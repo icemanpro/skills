@@ -16,7 +16,8 @@
 | 子目录卡片 | `[data-testid="folder-click-area"]`；快照里按 `folder-draggable-zone-(\d+)` 切分 | `H.st.folders` 用快照切分；换版本时先与 locator 计数交叉验证 |
 | 选中态（**每卡片 2 节点**） | `[data-testid="basic-selectable_0"].checked` + `.synofoto-selectable-wrapper.checked` | 用它计数会翻倍 |
 | 选中态（每卡片 1 节点，推荐） | `[data-testid="file-clickable-area"]:has(.synofoto-selectable-wrapper.checked)` | 区间选择是否成功就靠它 |
-| 单张选择按钮 | `button[data-testid="select-button"]` | 区间选择的锚点 |
+| 单张选择按钮 | `button[data-testid="select-button"]` | 区间选择的锚点；**它是开关**：卡片已 checked 时再点一次会**取消**选中（`H.selTap` 内部先判 checked，返回 true 后计数读到 0 也按 1 处理） |
+| 目录封面坏图（**另一类缺陷**） | 卡片是 `synofoto-small-item-folder-item`，不是 `file-clickable-area` | 目录内 `all=1` 且没有照片；扩展的「生成预览」对它**不生效**，在 `res2[id].err` 标 `folder-cover-broken` 单列（实测 3488/3515/3642/4052），既不算失败也不算完成 |
 | 缩略图尺寸 | `button[aria-label="更改预览大小"]` → `[aria-label="small thumbnail size"]` | 容量**随视口变化**（见陷阱 16）；`更改预览大小` 按钮可能不存在（页面上只剩 small/medium/large thumbnail size），`H.sizeSmall` 吞错，调完必须复测窗口容量 |
 | 右键菜单 | `.synofoto-right-click-menu` + 其中 `button` 名为「生成预览」 | 菜单 `boundingBox.x = -50000` 表示被 parked，等于没打开 |
 | 配额弹窗 | 点「生成预览」后出现名为「确定」的按钮 | 文案：您每个空间最多可以新增120个项目以生成预览 |
@@ -44,6 +45,9 @@
 | 单批上限（工程取值） | 110 | 留余量避开配额 |
 | 逐张点选耗时 | 平均 6.7 秒/张（110 张≈12 分钟） | 区间选择是唯一可行路径 |
 | 扩展桥单次往返 | 2–8 秒 | 每目录地板耗时约 25–40 秒 |
+| `PW().waitForTimeout(ms)` | **单次往返约 4.6 秒**（与传入的 ms 无关） | 一律换成 `H.sleep(ms)`（本地 `setTimeout`，零往返）；引擎已全量替换，写新代码别再用它 |
+| 页面内 `evaluate` 快原语 | 一次往返做完「点选 + 轮询 checked」 | `H.selTap` / `H.selShift`（elementFromPoint 合成 Shift）/ `H.selCount2` / `H.menuInfo` / `H.clickGen` / `H.brokenCount` / `H.dialogOpen` / `H.dismissDialog`；失败一律退回 Playwright 慢路径。整轮提速约 2 倍 |
+| 转换速率（扩展端侧） | **约 0.5 张/秒**（硬下限） | 排空预算按这个估：二轮干净目录 ~4s、有坏图目录 30–65s，脏区一格只推进 10–13 个目录 |
 | 单窗口条目（**随视口变化，不是常数**） | 最大化实测 198；Chrome 重启后视口变小，同一轮 13 目录抽样为 81 / 100 / 143 | 决定翻页次数与「大目录」阈值；窗口缩小后 >120 项目录的尾部扫不到（陷阱 16） |
 | 大目录收敛实测 | 目录 22（261 项）提交 259 项 / 6 批 / 1 次配额退避 / 340 秒 | 提交优先、复检靠第二遍更省时间 |
 
@@ -95,6 +99,29 @@
     ③ 这一步会自动多开一个 `https://<host>/` 门户标签：`list_pages` 拿它的 `pageId` → `close_page { pageId }`，只留一个 Photos 标签，否则 boot 认领歧义。
     ④ `H.probe()` 确认渲染出卡片再跑批量。
     连接层报错（「没有可用的外部浏览器」）只进 `rep.errs`，不标 done、不提交，收尾仍 persist，游标零损失（实测 8 个目录 7435/7436/7437/7438/7440/7441/7442/7443）。
+18. **前台判据是 `visibilityState`，不是「标签被选中」；被完全遮挡也算 hidden**（2026-11-11 实测，代价最大的一条）：
+    - 10:20 用户切去别的网站 → `document.visibilityState='hidden'` → 之后 4 个目录全 `stalled`（`loaded 0/7`、`0/19`、`0/12`），**每目录白烧 115–180s 还挤占空间级配额**。扩展只在可见页面转换，后台提交等于白提。
+    - 11:21 更隐蔽：Photos 是**选中页**、`hasFocus=true`，`visibilityState` 仍 `hidden` ⇒ Chrome 的原生窗口遮挡计算 `CalculateNativeWinOcclusion` 把被别的窗口完全盖住的窗口判成隐藏。
+    - **SDK 侧无解，别再逐个试**（都实测过）：
+
+      | 手段 | 实测结果 |
+      | --- | --- |
+      | `visibility.set(true)`（SDK 能力） | 只恢复**最小化**，对遮挡无效 |
+      | `Page.bringToFront`（CDP） | 被 CDP allowlist 拒绝 |
+      | `management` 能力 | 只开放 `getVersion` / `getWindows` / `getSessionName`，没有置前/改窗口状态 |
+      | 注册表策略 `HKCU\…\Google\Chrome\CalculateNativeWinOcclusion=0` | **不生效**（重启后仍 hidden） |
+
+    - **有效解（15:3x 实测）**：让人用命令行重启 Chrome 带 `--disable-features=CalculateNativeWinOcclusion --restore-last-session <launchApp URL>`。复测（窗口 `state=maximized`、`focused=false`，即被完全遮挡）：`visibilityState=visible, hasFocus=false`。**最小化 / 切到别的标签页仍会 hidden，所以闸要留着**：`H.visibility()` 读判据、`H.foregroundGate({waitMs})` 每 10s 探一次，等不到就 `{ok:false, reason:'tab-hidden'}` → 收尾回报，绝不提交。
+    - 重启的连带坑：DSM `launchApp` 会多开一个 `https://<host>/` **门户标签**，两个同 host 标签让 `boot()` 报 ambiguous → claim + `close_page` 关掉门户标签；此后 boot 走 **adopted** 分支，`ready().ok=false` 但实际可用（见陷阱 15）。
+19. **CDP 会话整格卡死是人工停机点**：实测一个目录完成后，接下来 3 个目录连续报 `Tool command waited too long in queue`，随后 `tab.url()` / `tabs.selected()` / `tabs.new()` 全部超时，**新建浏览器会话也无效**。只能让人刷新或关掉重开那个 Photos 标签页（有弹窗先点掉），再 `H.ready()` 从游标继续；报错目录未标 done 会自动重跑。别原地重试，也别误判成登录过期。
+
+## 台账落盘与自愈（已按 TDD 修，`test_persist_atomic.mjs`）
+
+- **原子替换**：`persist()` 先写 `<台账>.tmp` 再 `renameSync` 覆盖主文件，跑完不留 `.tmp`。起因是实测事故：直接 `writeFileSync` 覆写 900KB 台账时，常驻监视进程读到半截文件，报 `SyntaxError: Expected double-quoted property name in JSON at position 930625`。写的人自己没事，但**内核若恰好在同一时刻被回收**，重启 `load()` 会抛异常 → 二轮游标从零开始。
+- **`.bak` 自愈**：`load()` 不再裸 `JSON.parse`。主文件坏/缺而 `.bak` 可读时，**用 `.bak` 修好主文件并恢复游标**；两个都坏才返回 `{loaded:false, reason:'corrupt'}`，并把内存（含 `p2.done`）一起清零 —— **绝不抛异常、也绝不带着半个游标继续跑**。
+- **`corrupt` 的处置是手工救，不是重跑整轮**：按修改时间挑最新的 `ledger-*.bak` / `ledger-*.conflict-*`，逐个验能 `JSON.parse`、`folders/vDone/p2.done/totSent` 数量对得上，`cp` 成主文件后再 `H.load()`。直接重跑会白烧几小时浏览器时间。
+- **`force:true` 不写 `.bak`**（走的是另一条分支）：撤销假标记前自己 `copyFileSync` 留一份 `.before-revoke`。
+- **附加证据一起落盘**：固定白名单之外的自有字段（`apiAudit` / `repair` / `headAudit` / `apiAuditMeta` …）都写盘并在 `load` 时读回；`__` 前缀内部状态与 `tr` 内存日志不落盘；换台账时附加字段一并清零（防串任务）。审计结论仍要另写一份独立 JSON。
 
 ## 台账 schema（`__LED` / 持久化 JSON）
 
@@ -105,7 +132,9 @@ folders[id]        = {id, name, total, kids}    // 目录清单；name 是完整
                                                // processTree 重入时整条覆盖（不是合并），事后写的 src:'api-recheck-…' 会被冲掉
                                                // 手工建档（API 补漏）必须写 name，不是 path：p2Pass 取 f.name || id 当 node.path，
                                                //   写成 path 会让报告/排空日志里的路径退化成裸 id（2026 台账 32341–32345 这 5 条就是）
-res2[id]           = {id, pass, total, sent, batches, quota, drained, stillBadWindow, blocked, clean, done, elapsed, windowsSeen}
+res2[id]           = {id, pass, total, sent, batches, quota, drained, stillBadWindow, blocked, clean, done, elapsed, windowsSeen, win}
+                                               // win = 这次判干净覆盖了多少张（pumpX2 的 rec 写）；H.debtPaid 靠它决定能不能销 needDrain 欠账
+                                               // err:'folder-cover-broken' = 目录封面坏图，扩展修不了，单列（见选择器表）
 res2[id].drain     = {reason, loaded, all, bad, waited, at}   // 排空审计：reason=converted 才是真的转换完；all 只覆盖渲染窗口
 res2[id].repair    = {smBrokenBefore, items, batches, fixed, drain, at, via}   // 尾部/窗外补修记账（desc-sort + toolbar）
 res2[id].noTiles   = true                       // 只有子目录、没有图片瓦片
@@ -116,8 +145,13 @@ pendingSamples     = [id...]                    // 空间级排空探针目录�
 treeStack          = [{id, path, phase}]        // DFS 栈，末元素是下一个要处理的节点；phase ∈ enter|exit
 vDone[id]          = {id, total, done}          // 已处理目录；由 processTree（enter/exit）或 pumpX2 写，p2Pass 判干净的分支不写
 needDrain[id]      = {total, at, sent, why}     // 已提交但还没排空完；续跑进该目录时先补排空，converted/empty 后删除；why:'revoke' 是撤销假标记时补的欠账
+                                               // 销账判据 H.debtPaid(r,total)：r.clean 且（win>=total 整页覆盖 / noTiles / total===0）才删；
+                                               // 证据只盖渲染窗口时保留欠账（7979：82 项、窗口 81、converted，窗外那条 HEAD sm 404）
 retry[id]          = n                          // stalled/timeout 等记账，第二遍复检补做；>=6 时 p2.done 标 2
 aud[id]            = {id, swept, broken, noSrc, videos, at}   // H.audit 滚动全扫；swept < 页项数时 broken===0 只是窗口内结论
+headAudit[id]      = {id, total, n, pages, nock, types, videos, smBad, xlBad, other, errs, ok, at}
+                                               // scripts/head_audit.mjs 的单目录逐项 HEAD 证据（附加字段，persist 会落盘）
+                                               // ok = n>0 && nock===0 && smBad/xlBad/other/errs 四个都空；other 是非 200/404，算结论不确定
 p2.done[id]        = 1 | 2 | 3                  // 二轮游标：1=亲验干净，2=六次仍坏（已知坏，不是假干净），3=证据/审计采信
 totSent            = n                          // 该台账累计提交条目数
 ```

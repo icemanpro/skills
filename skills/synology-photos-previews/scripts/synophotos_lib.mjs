@@ -43,6 +43,7 @@ var L = globalThis.__LED = globalThis.__LED || {
 L.folders = L.folders || {}; L.res2 = L.res2 || {}; L.subm = L.subm || {}; L.stuckIds = L.stuckIds || {};
 L.vDone = L.vDone || {}; L.tr = L.tr || []; L.retry = L.retry || {}; L.vQueue = L.vQueue || [];
 L.pendingSamples = L.pendingSamples || []; L.aud = L.aud || {}; L.needDrain = L.needDrain || {};
+L.headAudit = L.headAudit || {};                     // 逐项 HEAD 审计证据（附加字段，persist 会一起落盘）
 L.p2 = L.p2 || {}; L.p2.done = L.p2.done || {};      // 第二轮复检游标（必须落盘，见 test_persist_p2.mjs）
 
 /* ---------- 连接与导航 ---------- */
@@ -100,6 +101,35 @@ H.goto = async function (id) {
   await H.nav(id);
   await H.sleep(3200);
   await H.G(() => H.PW().locator('body').press('Escape')).catch(() => {});
+};
+
+/* ---------- 前台闸门（提交之前必须过） ----------
+ * 扩展只在「可见」的标签页里转换。2026-11-11 10:20 用户切去别的站点，visibilityState=hidden，
+ * 之后 4 个目录全部 stalled（loaded 0/7、0/19、0/12），每目录白烧 115–180s 还挤占空间配额。
+ * 更隐蔽的一种：Photos 是选中页、hasFocus=true，但窗口被别的窗口完全盖住 ⇒ 仍然 hidden
+ *（Chrome 的原生窗口遮挡计算）。SDK 侧无解，只能重启 Chrome 时关掉该特性，见 references/runbooks.md。
+ * 最小化 / 切到别的标签页同样会 hidden，所以这道闸要一直留着：不可见就收尾回报，绝不提交。 */
+H.visibility = async function () {
+  return String(await H.G(() => H.PW().locator('body').evaluate('() => document.visibilityState')));
+};
+
+// 轮询等前台。opts: probe/sleep（可注入，便于测试）、waitMs（默认 240s）、pollMs（默认 10s）。
+// 轮询次数由 waitMs/pollMs 封顶：探针抛错或时钟不走也不会死循环。
+// 返回 {ok, vis, waited, polls}；ok:false 时 reason='tab-hidden'，调用方必须收尾而不是提交。
+H.foregroundGate = async function (opts) {
+  var o = opts || {};
+  var probe = o.probe || H.visibility, sleep = o.sleep || H.sleep;
+  var waitMs = o.waitMs == null ? 240000 : Number(o.waitMs);
+  var pollMs = Math.max(1, o.pollMs == null ? 10000 : Number(o.pollMs));
+  var maxPolls = Math.max(1, Math.ceil(waitMs / pollMs));   // 预算为 0 也要先探一次
+  var t0 = Date.now(), polls = 0, vis = 'err';
+  for (;;) {
+    polls++;
+    try { vis = String(await probe()); } catch (e) { vis = 'err'; }
+    if (vis === 'visible') return { ok: true, vis: vis, waited: Date.now() - t0, polls: polls };
+    if (polls >= maxPolls) return { ok: false, vis: vis, reason: 'tab-hidden', waited: Date.now() - t0, polls: polls };
+    await sleep(pollMs);
+  }
 };
 
 /* 图片状态安定闸门（第二遍扫描的干净判据必须过这一关）。
@@ -569,6 +599,19 @@ H.splitBudget = function (deadline, now, opts) {
   return { pump: pump, reserve: reserve, left: left, ok: pump > minPump };
 };
 
+// 「这个目录还欠一次排空吗」的唯一判据。零提交 + clean 只说明**渲染窗口内**没有坏图：
+// 7979 有 82 项、窗口只挂载 81 张，页面报 clean、台账 drain:converted，而窗外第 82 条
+// HEAD sm 连测 3 次都是 404。所以销账必须要求整页覆盖（win >= total），
+// 或者根本没有可转换的图（noTiles / total===0）。拿不到窗口证据就一律留着欠账。
+H.debtPaid = function (r, total) {
+  if (!r || !r.clean) return false;
+  var tot = Number(total == null ? r.total : total) || 0;
+  if (r.noTiles) return true;
+  if (tot === 0) return true;
+  var win = Number(r.win) || 0;
+  return win > 0 && win >= tot;
+};
+
 // 在当前目录等转换完成，并把结果记进台账。
 // 返回 pause 非空时上层必须保存栈退出：宁可停在这一格，也不能把没转换完的目录丢下。
 // opts.safety 由调用方透传（小目录用 H.smallBudget().safety）：90s 安全垫是给大目录的
@@ -611,7 +654,11 @@ H.submitAndDrain = async function (node, total, deadline, phase, opts) {
   // （budget / sel-fail / gp-* / quota / stuck-window），必须暂停。返回 pause=null 会让
   // processTree 的叶子分支无条件标 done —— 2026-11-11 的 7333/7335/7336 就是这样假完成的。
   if (!(r.sent > 0)) {
-    if (r.clean) return { r: r, dr: null, pause: null, submitted: 0 };
+    if (r.clean) {
+      // 整页已证明干净才销账；证据只盖渲染窗口时保留 needDrain（下一格补排空 / 逐项 HEAD 再说）
+      if (H.debtPaid(r, total)) delete L.needDrain[node.id];
+      return { r: r, dr: null, pause: null, submitted: 0 };
+    }
     return { r: r, dr: null, pause: 'SUBMIT_BLOCKED', submitted: 0 };
   }
   // 只要提交过就必须等，blocked（sel-fail / budget / quota）也不例外。
@@ -773,9 +820,10 @@ H.pumpX2 = async function (id, budgetMs, opts) {
     if (!wrp.ok) return rec({ sent: 0, batches: 0, quota: 0, stillBadWindow: 0, windowsSeen: 0, done: false, blocked: 'not-rendered' });
     ps = H.parse(await H.snap()); win = ps.length;
   }
-  if (!win) { var r0 = rec({ sent: 0, batches: 0, quota: 0, stillBadWindow: 0, windowsSeen: 0, clean: true, noTiles: true, done: true, blocked: null }); L.vDone[id] = r0; return r0; }
+  if (!win) { var r0 = rec({ sent: 0, batches: 0, quota: 0, stillBadWindow: 0, windowsSeen: 0, win: win, clean: true, noTiles: true, done: true, blocked: null }); L.vDone[id] = r0; return r0; }
   if (tot > 120 && win < 120) { await H.sizeSmall(); ps = H.parse(await H.snap()); win = ps.length; }
-  if (badOf(ps).length === 0 && tot <= win) { var r1 = rec({ sent: 0, batches: 0, quota: 0, stillBadWindow: 0, windowsSeen: 1, clean: true, done: true, blocked: null }); L.vDone[id] = r1; return r1; }
+  // win 是「这次判干净覆盖了多少张」的证据：H.debtPaid 靠它决定能不能销 needDrain 欠账
+  if (badOf(ps).length === 0 && tot <= win) { var r1 = rec({ sent: 0, batches: 0, quota: 0, stillBadWindow: 0, windowsSeen: 1, win: win, clean: true, done: true, blocked: null }); L.vDone[id] = r1; return r1; }
   var sub = L.subm[id] || (L.subm[id] = {});
   // 本轮内已提交的 id：broken 是瞬时状态，刚提交完仍会显示坏图，不去重就会重复提交并挤占配额
   var runDone = {};
@@ -824,7 +872,7 @@ H.pumpX2 = async function (id, budgetMs, opts) {
     ps = p2;
   }
   var fin = badOf(ps).length;
-  var r = rec({ sent: sent, batches: batches, quota: quota, drained: drained, stillBadWindow: fin, blocked: blocked, done: !blocked, windowsSeen: w, clean: (sent === 0 && fin === 0) });
+  var r = rec({ sent: sent, batches: batches, quota: quota, drained: drained, stillBadWindow: fin, blocked: blocked, done: !blocked, windowsSeen: w, win: ps.length, clean: (sent === 0 && fin === 0) });
   L.vDone[id] = r;
   return r;
 };
@@ -1094,6 +1142,85 @@ H.processTree = async function (rootId, opts) {
   L.treeStack = [];
   await H.persist('tree-complete');
   return { done: true, processed: count, submitted: submitted, totSent: L.totSent };
+};
+
+/* ---------- 缺口补跑游标 + 逐项 HEAD 审计原语 ----------
+ * 这两件事此前只活在一次性 cell 里：多根跨格游标手贴一遍、分页/去重/URL quoting/8 并发再手贴一遍，
+ * 常量抄错就白烧一格，语义也没地方回归。收进库后由 scripts/gap_runner.mjs、scripts/head_audit.mjs 调用，
+ * 判据由 test_gap_ops.mjs / test_head_audit.mjs 钉住。 */
+
+// 本格该跑哪一根：栈非空就续栈底那一根（fresh:false），栈空取计划里第一个未完成的根（fresh:true）。
+// 栈底不在本计划里 ⇒ stack-other-root，绝不硬跑（两个任务的游标会互相踩）。
+H.gapNextRoot = function (plan, led) {
+  var G2 = led || L, st = G2.treeStack || [], list = plan || [];
+  var isDone = function (id) { var v = (G2.vDone || {})[String(id)]; return !!(v && v.done); };
+  if (st.length) {
+    var bottom = String(st[0].id);
+    var hit = list.find(function (x) { return String(x.id) === bottom; });
+    if (!hit) return { err: 'stack-other-root', id: bottom };
+    return { id: String(hit.id), path: hit.path, fresh: false };
+  }
+  var next = list.find(function (x) { return !isDone(x.id); });
+  if (!next) return { done: true };
+  return { id: String(next.id), path: next.path, fresh: true };
+};
+
+// 缩略图 HEAD 探针 URL。cache_key / size 都要带 %22 引号（服务端按 JSON 字符串解析），
+// 缺 SynoToken 会 803。404=缺、200=有；size="sm" 是网格那一档、"xl" 是灯箱那一档。
+H.thumbHeadUrl = function (id, ck, size, tok) {
+  return '/synofoto/api/v2/t/Thumbnail/get?id=' + id
+    + '&cache_key=' + encodeURIComponent(JSON.stringify(String(ck)))
+    + '&type=%22unit%22&size=' + encodeURIComponent(JSON.stringify(String(size || 'sm')))
+    + '&SynoToken=' + encodeURIComponent(String(tok == null ? '' : tok));
+};
+
+// 按 id 去重、保留首次出现顺序：takentime 相同的条目跨页会重复出现。
+H.dedupeItems = function (list) {
+  var seen = {}, out = [];
+  (list || []).forEach(function (x) {
+    if (!x || x.id == null) return;
+    var k = String(x.id);
+    if (seen[k]) return;
+    seen[k] = 1; out.push(x);
+  });
+  return out;
+};
+
+// 页内一次跑完全部条目的 HEAD 探针源码。三个 shim 约束：
+//   ① 必须「求值后是一个函数」，IIFE 会被拒；② evaluate 的第二个参数会被丢掉 ⇒ 数据内联；
+//   ③ 逐条往返太慢，8 并发实测 ~100 次 HEAD/秒（271 条约 5.5s）。
+// rows: [{id, ck, type}]；返回 JSON 字符串 {smBad, xlBad, errs, n, types}。
+// URL 构造与 H.thumbHeadUrl 同一口径，改一处要改两处。
+H.headAuditSource = function (rows, tok) {
+  return 'async function () {'
+    + ' var rows = ' + JSON.stringify(rows || []) + ', tok = ' + JSON.stringify(String(tok == null ? '' : tok)) + ';'
+    + ' var sizes = ["sm", "xl"], out = { smBad: [], xlBad: [], other: [], errs: [] }, types = {};'
+    + ' rows.forEach(function (r) { var t = r.type || "?"; types[t] = (types[t] || 0) + 1; });'
+    + ' var url = function (r, size) {'
+    + '   return "/synofoto/api/v2/t/Thumbnail/get?id=" + r.id'
+    + '     + "&cache_key=" + encodeURIComponent(JSON.stringify(String(r.ck)))'
+    + '     + "&type=%22unit%22&size=" + encodeURIComponent(JSON.stringify(String(size)))'
+    + '     + "&SynoToken=" + encodeURIComponent(tok);'
+    + ' };'
+    + ' var i = 0;'
+    + ' var worker = async function () {'
+    + '   while (i < rows.length) {'
+    + '     var r = rows[i++];'
+    + '     for (var s = 0; s < sizes.length; s++) {'
+    + '       var size = sizes[s];'
+    + '       try {'
+    + '         var res = await fetch(url(r, size), { method: "HEAD" });'   // 404 会带 12KB HTML，别读 body
+    + '         if (res.status === 404) (size === "sm" ? out.smBad : out.xlBad).push(r.id);'
+    + '         else if (res.status !== 200) out.other.push([r.id, size, res.status]);'   // 500/803 不是「缺图」，别混判
+    + '       } catch (e) { out.errs.push([r.id, size, String((e && e.message) || e).slice(0, 60)]); }'
+    + '     }'
+    + '   }'
+    + ' };'
+    + ' var ws = []; for (var k = 0; k < 8; k++) ws.push(worker());'
+    + ' await Promise.all(ws);'
+    + ' out.n = rows.length; out.types = types;'
+    + ' return JSON.stringify(out);'
+    + '}';
 };
 
 /* ---------- 台账持久化 ---------- */

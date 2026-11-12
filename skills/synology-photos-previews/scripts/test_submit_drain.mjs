@@ -270,5 +270,37 @@ await test('drainNode：converted 后清标记（用于下一格补排空）', a
   } finally { restore(); }
 });
 
+// 零提交 + 页面干净时的欠账（2026-11-12 审计）：drainNode 在 converted/empty 时销账，
+// 但 submitAndDrain 的 clean 分支直接 return，needDrain 里的旧标记永远留着 ⇒
+// 汇总永远挂假「待补排空」，processTree 重入还白烧一次 drainNode。
+// 反过来也不能一律销：clean 只覆盖渲染窗口时（7979：82 项 / 窗口 81），窗外那条可能仍缺。
+await test('零提交且整页装得下的 clean：销掉 needDrain 欠账（与 drainNode 口径一致）', async () => {
+  stub({
+    goto: async () => {}, persist: async () => true, spaceDrain: async () => ({}),
+    pumpX2: async () => ({ id: '4112', sent: 0, clean: true, total: 16, win: 16 }),
+    drain: async () => okDrain
+  });
+  try {
+    L.needDrain['4112'] = { total: 16, sent: 16, why: 'revoke' };
+    const res = await H.submitAndDrain(node, 16, Date.now() + 500000, 'enter');
+    assert.equal(res.pause, null);
+    assert.equal(L.needDrain['4112'], undefined, '整页已证明干净，欠账却没销');
+  } finally { restore(); }
+});
+
+await test('零提交但窗口装不下整页：clean 只是窗口内结论，欠账必须留着', async () => {
+  stub({
+    goto: async () => {}, persist: async () => true, spaceDrain: async () => ({}),
+    pumpX2: async () => ({ id: '4112', sent: 0, clean: true, total: 82, win: 81 }),
+    drain: async () => okDrain
+  });
+  try {
+    L.needDrain['4112'] = { total: 82, sent: 81 };
+    const res = await H.submitAndDrain(node, 82, Date.now() + 500000, 'enter');
+    assert.equal(res.pause, null);
+    assert.ok(L.needDrain['4112'], '窗口外还没核验就把欠账销了');
+  } finally { restore(); }
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
