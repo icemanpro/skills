@@ -46,7 +46,7 @@
 | 逐张点选耗时 | 平均 6.7 秒/张（110 张≈12 分钟） | 区间选择是唯一可行路径 |
 | 扩展桥单次往返 | 2–8 秒 | 每目录地板耗时约 25–40 秒 |
 | `PW().waitForTimeout(ms)` | **单次往返约 4.6 秒**（与传入的 ms 无关） | 一律换成 `H.sleep(ms)`（本地 `setTimeout`，零往返）；引擎已全量替换，写新代码别再用它 |
-| 页面内 `evaluate` 快原语 | 一次往返做完「点选 + 轮询 checked」 | `H.selTap` / `H.selShift`（elementFromPoint 合成 Shift）/ `H.selCount2` / `H.menuInfo` / `H.clickGen` / `H.brokenCount` / `H.dialogOpen` / `H.dismissDialog`；失败一律退回 Playwright 慢路径。整轮提速约 2 倍 |
+| 页面内 `evaluate` 快原语 | 一次往返做完「点选 + 轮询 checked」 | `H.selTap` / `H.selShift`（elementFromPoint 合成 Shift）/ `H.selCount2` / `H.menuInfo` / `H.clickGen` / `H.brokenCount` / `H.dialogOpen` / `H.dismissDialog`；失败一律退回 Playwright 慢路径。整轮提速约 2 倍。**弹窗三条（`dialogOpen`/`dismissDialog`/`dialogGate`）只认可见对话框并按文案分类，见陷阱 20** |
 | 转换速率（扩展端侧） | **约 0.5 张/秒**（硬下限） | 排空预算按这个估：二轮干净目录 ~4s、有坏图目录 30–65s，脏区一格只推进 10–13 个目录 |
 | 单窗口条目（**随视口变化，不是常数**） | 最大化实测 198；Chrome 重启后视口变小，同一轮 13 目录抽样为 81 / 100 / 143 | 决定翻页次数与「大目录」阈值；窗口缩小后 >120 项目录的尾部扫不到（陷阱 16） |
 | 大目录收敛实测 | 目录 22（261 项）提交 259 项 / 6 批 / 1 次配额退避 / 340 秒 | 提交优先、复检靠第二遍更省时间 |
@@ -114,6 +114,14 @@
     - **有效解（15:3x 实测）**：让人用命令行重启 Chrome 带 `--disable-features=CalculateNativeWinOcclusion --restore-last-session <launchApp URL>`。复测（窗口 `state=maximized`、`focused=false`，即被完全遮挡）：`visibilityState=visible, hasFocus=false`。**最小化 / 切到别的标签页仍会 hidden，所以闸要留着**：`H.visibility()` 读判据、`H.foregroundGate({waitMs})` 每 10s 探一次，等不到就 `{ok:false, reason:'tab-hidden'}` → 收尾回报，绝不提交。
     - 重启的连带坑：DSM `launchApp` 会多开一个 `https://<host>/` **门户标签**，两个同 host 标签让 `boot()` 报 ambiguous → claim + `close_page` 关掉门户标签；此后 boot 走 **adopted** 分支，`ready().ok=false` 但实际可用（见陷阱 15）。
 19. **CDP 会话整格卡死是人工停机点**：实测一个目录完成后，接下来 3 个目录连续报 `Tool command waited too long in queue`，随后 `tab.url()` / `tabs.selected()` / `tabs.new()` 全部超时，**新建浏览器会话也无效**。只能让人刷新或关掉重开那个 Photos 标签页（有弹窗先点掉），再 `H.ready()` 从游标继续；报错目录未标 done 会自动重跑。别原地重试，也别误判成登录过期。
+20. **弹窗识别：全表扫「确定」按钮＝可能点下删除确认**（2026-11-12 事故，用户报「为什么刚才弹出删除界面」）：
+    - 现场：gap 补跑期间页面出现「**在删除之前启用回收站** —— File Station 中的回收站可让您恢复从 Synology Photo 删除的项目…」。这是 DSM 拦下的一次删除尝试（回收站没开，删除没执行）。**取证（只读）**：用 Folder/Item 接口把整棵树重数一遍分 4 块对比审计基线 —— `shrunk=[] grew=0 errs=0`，**没有任何目录或条目丢失**；但弹窗文案里「从 Synology Photo 删除的项目」是 DSM 的通用措辞，不足以证明删的就是这个库点出来的，触发路径也无法事后取证（`L.tr` 内存日志随 kernel 回收丢了 —— 又一条例外要记：判据日志别只挂内存）。
+    - 库里确实存在的两条可疑路径：① 旧 `dialogOpen`/`dismissDialog` 遍历 `document.querySelectorAll('button')` 找**第一个**「确定」并直接 `click()` —— 删除确认框的按钮正是它；② `genPreview2` 的右键失败分支 `continue` **不关残留右键菜单**，菜单第一项是「删除」，而 `selSpan3`/翻页点击带 `force:true`（跳过可操作性检查，也不做遮挡命中测试），下一次点选可能直接打在菜单项上。
+    - 判据修正：**关掉但没卸载的对话框节点仍留在 DOM**，按 `button` 文本全表扫会一路误报「有弹窗」（实测连按 Escape 也"关不掉"，因为那些本来就不是开着的）；必须按节点判可见 —— `getBoundingClientRect().width > 10` + `getComputedStyle` 的 `display/visibility/opacity`，并连带检查 `ReactModal__Overlay` / `mask` 祖先（隐藏遮罩里的内容不算开着）。候选选择器集中在 `H.DIALOG_SEL`。
+    - 分类集中在纯函数 `H.classifyDialog(文案)`：`danger`（删除/移除/回收站/清空/永久/格式化/注销/退出登录/卸载 + 英文同名次）优先于 `quota`（同时命中「生成预览」与「最多可以新增/每个空间最多/待处理预览任务/超过」），认不出＝`other`，空＝`none`。**危险词优先**是刻意的：一条文案同时提到两者时宁可当危险处理。
+    - 行为收敛（= 弹窗护栏）：`dialogOpen()` 只对 `quota` 为真；`dismissDialog()` 只点**那个配额对话框内部**的确定（页内源码先按文案定位节点，再在节点作用域里找按钮），`danger`/`other` 连页面都不进（一次 evaluate 都不发）；`dialogGate()` 在 `pumpX2` 每批点选前拦 `danger`/`other` ⇒ `blocked:'dialog-blocking'`、`done:false`，零提交经 `submitAndDrain` 变成 `SUBMIT_BLOCKED` 暂停，绝不标完成；`genPreview2` 每次换候选前与三次候选都用尽后都 `H.dismissMenu()`（Escape 关菜单，吞错）；工具条点过但没生效且页上挂着认不出的弹窗时**不再走右键慢路**（`reason:'dialog-blocking'`）。
+    - 代价：每批多一次 evaluate 往返（2–8s），只在「这一批确实有坏图要点」时才花；干净目录不付这个钱。
+    - 现场遇到 `danger`：一个按钮都不要点，把文案原样回报给人，由他决定（runbooks「删除/未知弹窗挡住时」）。别自行点「确定」或「取消」—— 那两类按钮的语义正是「确认删除」。
 
 ## 台账落盘与自愈（已按 TDD 修，`test_persist_atomic.mjs`）
 

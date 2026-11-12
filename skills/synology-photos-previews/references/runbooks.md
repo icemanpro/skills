@@ -120,6 +120,16 @@ nodeRepl.write(JSON.stringify(await globalThis.__gapRun({
 - 手贴循环的旧日志只在异常出口写 stop ⇒ `cells` 会偏少，这时看 `lines` 与 `last` 判断有没有在推进。
 - 长泵期间台账数分钟不更新是正常的，判「卡死 vs 在跑」看日志有没有新行（任何新行都说明还在跑）；判「格子收尾了没」只看新的 **stop 行**，两者别混。
 
+## 删除/未知弹窗挡住时（`dialog-blocking`）：停机回报，不点任何按钮
+
+2026-11-12 实测：补跑期间用户页面弹出「**在删除之前启用回收站**」。库当时的两处缺陷（全表扫「确定」并直接点、右键菜单失败后不关）都可能造成它，修复见 dom-notes 陷阱 20 与 `test_dialog_guard.mjs`。**现场处置顺序**：
+
+1. **别再发格，也别点弹窗里任何东西**（「确定」「取消」的语义都可能就是确认删除）。先把文案原样抄给用户。
+2. **只读取证有没有真丢东西**（别用「页面看着还在」当证据）：用 `references/recheck-recipe.md` Cell 1 的页内递归枚举重跑一次整树，与审计基线求差集 —— 关注 `shrunk`（变小的目录）与 `errs`。实测这次 `shrunk=[] grew=0 errs=0`，即 **0 目录 / 0 条目丢失**；`grew` 非空只是新上传，与删除无关。
+3. **确认游标没被污染**：`node -e` 离线读台账，看被拦目录的 `res2[id]` —— `blocked:'dialog-blocking'` 必然 `sent:0`、`done:false`（零提交经 `submitAndDrain` 变 `SUBMIT_BLOCKED` 暂停，不标完成），`vDone` 不该有它。若发现 `sent:0` 却 `vDone.done=true` 就是假完成，按 Cell 5 用 `H.revokeFalseMarks` 撤（先 dryRun + 留副本）。
+4. 用户处理完弹窗（或明确说可以忽略）之后再 `H.ready()`（load 先于 boot）续发格。**不要自行点掉弹窗来「让跑批继续」**。
+5. 想知道这一格被拦了几次：`grep -c 'dialog-blocking' <台账目录>/run-*.jsonl` 与离线读 `res2` 里 `blocked==='dialog-blocking'` 的 id；同一目录反复被拦 ⇒ 页面上那个弹窗一直没走，回到第 1 步。
+
 ## 失败恢复
 
 - **Chrome 被整个重启**（cell 连报「没有可用的外部浏览器」、`list_pages` 只剩 `about:blank`）：按顺序做，别跳步——

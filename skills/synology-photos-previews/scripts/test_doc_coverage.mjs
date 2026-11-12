@@ -153,6 +153,18 @@ await test('C13 根目录 id 必须在树上核实，路径用 API 真名（可�
   assert.ok(/(核实|确认)[\s\S]{0,80}(根目录|rootId|根 id)/.test(SKILL + REC), '未写根 id 要核实、别猜');
 });
 
+await test('E18 弹窗护栏：手册写清「只关配额弹窗」，代码不许再全表扫确定按钮', () => {
+  assert.ok(LIB.includes('H.classifyDialog'), '引擎里 classifyDialog 不见了 —— 护栏被删？');
+  assert.ok(LIB.includes('H.dialogGate') && LIB.includes('H.dismissMenu'), '护栏原语 dialogGate / dismissMenu 缺失');
+  assert.ok(!/var bs = document\.querySelectorAll\('button'\)[\s\S]{0,120}'确定'[\s\S]{0,60}\.click\(\)/.test(LIB),
+    'dismissDialog 又退回「全表扫确定按钮并直接点」—— 那会点到删除确认框');
+  assert.ok(/dialog-blocking/.test(SKILL), 'SKILL.md 的 SUBMIT_BLOCKED 枚举未含 dialog-blocking');
+  assert.ok(/护栏/.test(SKILL), 'SKILL.md 未写弹窗护栏');
+  assert.ok(/护栏/.test(DOM), 'dom-notes 未写弹窗护栏');
+  assert.ok(/回收站/.test(DOM), 'dom-notes 未记 2026-11-12 的删除弹窗事故');
+  assert.ok(RUN.includes('dialog-blocking'), 'runbooks 未写弹窗挡住时的停机处置');
+});
+
 await test('D14/D15/D16 三个可跑脚本随包发布，并在 Resources 里列名', () => {
   ['scripts/head_audit.mjs', 'scripts/gap_runner.mjs', 'scripts/gap_progress.cjs'].forEach((f) => {
     assert.ok(fs.existsSync(path.join(ROOT, f)), '缺脚本: ' + f);

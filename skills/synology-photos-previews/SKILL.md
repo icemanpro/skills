@@ -1,6 +1,6 @@
 ---
 name: synology-photos-previews
-version: 1.0.0
+version: 1.0.1
 description: 群晖 Synology Photos 共享空间的缩略图/预览坏掉（「图片预览不出来」「重新生成预览」「synofoto-item-image-broken」「Synology Image Assistant」），或需要全树复查（「再检查一遍某年」「确认预览都生成好了」，台账全标 done 也要重核）、补漏与完成标记复核（「标了完成却还有坏图」「某个目录下整支子目录没跑」）时使用。仅适用于已登录该 NAS、装有 Synology Image Assistant 扩展的那台 Chrome：转换在浏览器端完成，服务端不会自己修好。
 ---
 
@@ -38,6 +38,7 @@ description: 群晖 Synology Photos 共享空间的缩略图/预览坏掉（「�
 - 单次 DOM/点击往返 2–8 秒（扩展桥延迟），所以每目录的地板耗时约 25–40 秒；吞吐瓶颈是延迟而不是配额。**转换速率约 0.5 张/秒**（实测硬下限）：二轮里干净目录 ~4s、有坏图目录 30–65s，脏区一格只推进 10–13 个目录，进入干净区域翻倍。排空预算按这个速率估，别按「提交完就切目录」。
 - `select-button` 是**开关**：卡片已 checked 时再点一次会**取消**选中（`H.selTap` 内部先判 checked，返回 true 后计数读到 0 也按 1 处理）。批量点选前先 `Escape`，逐张补点时别对已选中的卡片再点。
 - `Escape` 一键清空全部选中；每批选择前先清空，否则残留选中会让「想选 55 实选 121」并触发配额拒绝。
+- **弹窗护栏：库里任何函数都不许「看到确定按钮就点」（2026-11-12 事故）。** 补跑期间用户页面弹出「在删除之前启用回收站」—— 旧 `dialogOpen`/`dismissDialog` 正是对整份 document 扫第一个「确定」并直接点，那正是删除确认框的按钮；而 `genPreview2` 的右键失败分支 `continue` 不关残留菜单，菜单第一项就是「删除」。现在的判据：`H.classifyDialog(文案)` 把弹窗分成 `danger`（删除/移除/回收站/清空/注销…，**危险词优先于配额判据**）/ `quota`（同时提到「生成预览」与「最多可以新增」）/ `other` / `none`，且只认**真正可见**的对话框节点（关掉但没卸载的弹窗节点仍留在 DOM，必须用 rect + computed style 排除，否则一路误报 open）。`H.dialogOpen()` 只对 `quota` 为真，`H.dismissDialog()` 只点 quota 对话框**内部**的确定，`danger`/`other` 一律 `clicked:false`；`H.dialogGate()` 在 `pumpX2` 每批点选前拦停（`blocked:'dialog-blocking'`、`done:false`，零提交 ⇒ 上层 `SUBMIT_BLOCKED`，绝不标完成）；右键菜单开过又没提交成时 `H.dismissMenu()` 必须按 Escape 关掉。**现场遇到 danger 弹窗＝人工停机点**：一个按钮都不点，把文案回报给用户，让他决定（详见 runbooks「删除/未知弹窗挡住时」）。
 
 ## 工作流
 
@@ -66,7 +67,7 @@ description: 群晖 Synology Photos 共享空间的缩略图/预览坏掉（「�
 **返回值**：
 - `{ done: true, processed, submitted, totSent }` — 全部完成
 - `{ paused: true, remaining, processed, submitted }` — 即将超时，已保存栈，下次调用自动续跑
-- `{ paused: true, err, node }` — 主动暂停，`err` ∈ `NAV_MISMATCH`（URL 没落到目标目录）、`NOT_RENDERED`（URL 对了但瓦片/子目录卡片没渲染出来）、`CHILDREN_API`（子目录分页接口失败/返回非 JSON，例如 803 掉登录）、`CHILDREN_MISMATCH`（快照里有 API 没返回的子目录 id，两边不同源）、`SUBMIT_BUDGET`（剩余时间不够「提交+等转换」，本格不做）、`SUBMIT_BLOCKED`（pump 一张都没提交进去且页面仍脏：budget/sel-fail/gp-*/quota/stuck-window，**绝不标 done**）、`DRAIN_BUDGET`（已提交但没时间排空，留在原地）、`DRAIN_NOT_RENDERED`（排空时看不到瓦片）。这几种都**不会**把目录标 done，续跑时自动重做。
+- `{ paused: true, err, node }` — 主动暂停，`err` ∈ `NAV_MISMATCH`（URL 没落到目标目录）、`NOT_RENDERED`（URL 对了但瓦片/子目录卡片没渲染出来）、`CHILDREN_API`（子目录分页接口失败/返回非 JSON，例如 803 掉登录）、`CHILDREN_MISMATCH`（快照里有 API 没返回的子目录 id，两边不同源）、`SUBMIT_BUDGET`（剩余时间不够「提交+等转换」，本格不做）、`SUBMIT_BLOCKED`（pump 一张都没提交进去且页面仍脏：budget/sel-fail/gp-*/quota/stuck-window/dialog-blocking，**绝不标 done**）、`DRAIN_BUDGET`（已提交但没时间排空，留在原地）、`DRAIN_NOT_RENDERED`（排空时看不到瓦片）。这几种都**不会**把目录标 done，续跑时自动重做。
 
 **渲染闸门（2026-11-10 新增，与排空判据同样重要）**：`H.goto()` 之后 URL 立刻就对了，但网格可能十几秒后才渲染——实测目录 4127 在 goto + 9.2s 后仍是 `{all:0, folders:0}` 而 `totalShown=2`。旧代码只校验 URL，这种情况会把目录当「空叶子」标 `done`，**整支子目录静默丢失**（2026-11-08 的 414 事故同类）。现在进目录后先过 `H.waitRender(deadline)`：
 
@@ -144,7 +145,7 @@ Synology Image Assistant 只在**前台可见**的页面做转换：`document.vi
   **自查用 `H.falseMarks(L, {head, kids})`，别只用 `sent===0 && clean===false`**：后者只抓「零提交却标 done」这一类，抓不到 7979 那种**证据只盖渲染窗口**的假完成（82 项、窗口 81、`drain:converted`、`p2.done=1`，窗外第 82 条 HEAD sm 实测 404）。撤销走 `H.revokeFalseMarks({head, kids})`：内部已 `force:true`（撤销让内存 `vDone` 变少，必然撞回归保护），**必须查返回的 `ok===true`** —— 被拒时 `persist` 返回字符串而不是抛错，下一次 `load` 又把假标记读回来。它只删 `vDone`/`p2.done`，保留 `res2`/`retry`/`L.aud` 等历史证据，给 `sent>0` 却无 `drain` 的目录补 `needDrain` 欠账；`p2.done=2`（六次仍坏，已知坏不是假干净）与证据不足的 `unknown` 桶不动，**也别手动删年度根的 `vDone`**（那等于整年重跑）。
   `head` 是逐项 HEAD 结果（`recheck.json` 的 `res`，**必须盖上修复后的 `repair.dirRecheck` / `newDirsAudited`**，否则已修好的目录被再撤销一次），`kids` 从 API 父链数出来：台账 1257 条里只有 45 条记了 `kids`，把 `total` 当图片数会把纯容器 7227（130 全是子目录、连 `res2` 都没有）误判成「130 张图全无证据」。实测同一份台账：喂 head+kids 报 **1** 个（正是 7979），只喂 kids 报 23 个、什么都不喂报 14 个且 857 个判不了 ⇒ 按 DOM/台账证据撤销会误撤销 22 个。四个桶（bad/trusted/unknown/gaveup）的判据与可跑模板见 `references/recheck-recipe.md` Cell 5。
 - **台账附加字段必须落盘（2026-11-11 发现的证据丢失）**：旧 `H.persist` 只写一份固定白名单，`L.apiAudit` / `L.repair` / `L.apiAuditMeta` 这类审计证据**从未落盘**（#14 的 3006 条逐项 HEAD 结果在主台账和两个 `.bak` 里都查不到，只剩报告正文）。现在白名单之外的自有字段一律当附加证据一起写盘、`load` 时读回；`__` 前缀的内部状态和 `tr` 内存日志仍不落盘；换台账时附加字段一并清零（防串任务）。**审计结论务必同时写一份独立 JSON**（如 `gap-audit-*.json`），别只挂在台账上。
-- 回归测试：`scripts/` 下 23 个 `test_*.mjs`，`for f in test_*.mjs; do node $f; done` 全绿 **270 例**（2026-11-12 实测）：boot_adopt 7、children 9、**doc_coverage 29**（手册覆盖：下面这些实测规则必须写在文档里，机械可检；含 README 与手册同口径、测试计数对账、runner 停机原因与代码逐一对账、Cell 4 不许再手贴多根循环、重启浏览器须人工、收尾信号是 stop 行而非任何新行）、drain 14、drain_loop 12、fast 10、**gap_ops 26**（补跑游标 gapNextRoot + HEAD 审计原语 + 每个收尾出口都写一行日志）、**gap_progress 6**（离线读 jsonl 进度，cells/lines/stops 口径）、**head_audit 8**（单目录逐项 HEAD，含真实执行 fetch 的 404/500 分流）、p2_pass 16、persist_atomic 3、persist_extra 6、persist_p2 7、**publish_hygiene 11**（发布卫生：无个人路径/IP/业务地名、测试相对 import、host 必填闸、文档一致性）、render_gate 10、revoke_marks 33、sel 4、settle 9、submit_drain 19、summarize 8、tail_reserve 6、toolbar_gen 7、tree_false_done 10。改引擎前先跑它们，改完再跑一遍；**改文档也要跑**（doc_coverage 会红）；**发布前还要把整个目录复制到别的路径再跑一遍**（验证换机可跑）。
+- 回归测试：`scripts/` 下 24 个 `test_*.mjs`，`for f in test_*.mjs; do node $f; done` 全绿 **288 例**（2026-11-12 实测）：**dialog_guard 17**（弹窗护栏：`classifyDialog` 四分类与危险词优先、只认可见对话框、`dismissDialog` 只点配额弹窗内部的确定（用假 DOM 实跑页内源码钉死）、`dialogGate` 拦 danger/other、右键菜单残留必须关、`pumpX2` 有危险弹窗时一张都不点且不标 done）、**doc_coverage 30**（手册覆盖：下面这些实测规则必须写在文档里，机械可检；含 README 与手册同口径、测试计数对账、runner 停机原因与代码逐一对账、Cell 4 不许再手贴多根循环、重启浏览器须人工、收尾信号是 stop 行而非任何新行）、drain 14、drain_loop 12、fast 10、**gap_ops 26**（补跑游标 gapNextRoot + HEAD 审计原语 + 每个收尾出口都写一行日志）、**gap_progress 6**（离线读 jsonl 进度，cells/lines/stops 口径）、**head_audit 8**（单目录逐项 HEAD，含真实执行 fetch 的 404/500 分流）、p2_pass 16、persist_atomic 3、persist_extra 6、persist_p2 7、**publish_hygiene 11**（发布卫生：无个人路径/IP/业务地名、测试相对 import、host 必填闸、文档一致性）、render_gate 10、revoke_marks 33、sel 4、settle 9、submit_drain 19、summarize 8、tail_reserve 6、toolbar_gen 7、tree_false_done 10、boot_adopt 7、children 9。改引擎前先跑它们，改完再跑一遍；**改文档也要跑**（doc_coverage 会红）；**发布前还要把整个目录复制到别的路径再跑一遍**（验证换机可跑）。
 
 **与旧模式的区别**：不再需要先遍历全树建 vQueue 再跑 workerX2。processTree 边发现边处理，适合深层目录树（3-4 层、数百个子目录）。旧的 `workerX2` + `pumpX2` 仍可用于已知叶子目录的批量提交或补提。
 
@@ -186,7 +187,7 @@ Chrome 重启、`TAB_NOT_OWNED`、kernel 回收、台账被覆盖、cell 中断�
 
 ## Resources
 
-- `scripts/synophotos_lib.mjs`：常驻 kernel 库（导航、快照解析、区间选择、生成预览、排空、配额退避、**前台闸 visibility·foregroundGate**、**深度优先递归处理 processTree**、逐目录引擎、台账持久化（原子替换 + `.bak` 自愈）、**欠账销账判据 debtPaid**、**假完成标记检测/撤销 falseMarks·revokeFalseMarks 与补跑根集 missingRoots**、**补跑游标 gapNextRoot 与逐项 HEAD 原语 thumbHeadUrl·dedupeItems·headAuditSource**）。作为 cell code 执行。
+- `scripts/synophotos_lib.mjs`：常驻 kernel 库（导航、快照解析、区间选择、生成预览、排空、配额退避、**前台闸 visibility·foregroundGate**、**弹窗护栏 classifyDialog·visibleDialog·dialogGate·dismissMenu（只关配额弹窗，danger/other 一个按钮都不点）**、**深度优先递归处理 processTree**、逐目录引擎、台账持久化（原子替换 + `.bak` 自愈）、**欠账销账判据 debtPaid**、**假完成标记检测/撤销 falseMarks·revokeFalseMarks 与补跑根集 missingRoots**、**补跑游标 gapNextRoot 与逐项 HEAD 原语 thumbHeadUrl·dedupeItems·headAuditSource**）。作为 cell code 执行。
 - `scripts/summarize_ledger.cjs`：读台账 JSON 输出统计（目录数、提交数、状态分布、剩余队列、stuckIds 按目录分组）。
 - `scripts/head_audit.mjs`：**单目录**逐项 HEAD 审计。装载后 `await globalThis.__headAudit(id, { write:true })`：Item 接口分页列全 → 按 id 去重 → 每条 `sm`/`xl` 各一次 HEAD，报 `{n, nock, types, videos, smBad, xlBad, other, errs, ok}`，`write` 时落 `L.headAudit[id]` 并 persist。**整棵树的批量审计走 recheck-recipe 的页内分块 runner**，别在 node 侧逐目录调它（每目录一趟桥往返）。
 - `scripts/gap_runner.mjs`：**多根缺口补跑的跨格游标**。装载后每格发 `await globalThis.__gapRun({ plan: globalThis.__plan, log:'<目录>/run.jsonl', cellMs:565000, waitVis:240000 })`：前台闸 → `H.gapNextRoot` 选根/续栈 → 一格推进多个根 → `paused` 立即收尾，逐根结果追加 jsonl。只定义全局函数、不自动跑；`LEDGER_NOT_LOADED` / `NO_PLAN` 有闸。**任何出口都写恰好一行 `stop` 日志**（九种停机原因与处置见 runbooks）；**收尾信号 = 含 `stop` 的那一行**，逐根 `{root,…}` 行是格子中途写的，别当收尾去 wait；判补跑完成看 `stop:'all-done'` 且 `rootsLeft === 0`。

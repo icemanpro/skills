@@ -279,22 +279,120 @@ H.brokenCount = async function () {
   }))) || 0;
 };
 
-H.dialogOpen = async function () {
-  try {
-    return !!(await H.G(() => H.PW().locator('body').evaluate(function () {
-      var bs = document.querySelectorAll('button');
-      for (var i = 0; i < bs.length; i++) if (String(bs[i].textContent).trim() === '确定') return true;
-      return false;
-    })));
-  } catch (e) { return false; }
+/* ---------- 弹窗护栏（2026-11-12 补跑事故后新增，改之前务必读完） ----------
+ * 事故：gap 补跑期间用户页面弹出「在删除之前启用回收站」。触发路径无法事后取证（L.tr 随 kernel
+ * 回收丢了，且全树重数确认 0 个目录 / 0 条条目丢失），但库里确实存在两条能造成它的路径：
+ *   ① genPreview2 的右键失败分支直接 `continue`，**不关残留的右键菜单** —— 菜单第一项就是「删除」，
+ *      下一次 scrollIntoView / 翻页点击落在菜单上就是真删；
+ *   ② 旧 dialogOpen / dismissDialog 对整份 document 扫第一个「确定」按钮并**直接点下去** ——
+ *      那正是删除确认框的按钮。
+ * 现在三条硬规则：
+ *   ① 只认「真正可见的对话框节点」的文案。ReactModal 关掉后节点仍留在 DOM 且带 --after-open 类，
+ *      按 button 文本全表扫必然误判（实测会一路报 open）；必须查 rect + computed style。
+ *   ② 文案命中危险词一律 danger：库的任何函数都不许点它的按钮，只回报给上层停机。
+ *   ③ 只有配额弹窗（提到「生成预览」且「最多可以新增」）才允许 dismissDialog 点「确定」，
+ *      其它一律 clicked:false。识别不了的弹窗按 danger 同等处置（见 H.dialogGate）。
+ * 页面侧只负责「找可见对话框 + 取文案」，分类留给 node 侧纯函数 H.classifyDialog —— 判据只有一份，可单测。
+ */
+
+// 纯函数：给一段弹窗文案分类。危险词优先于配额判据（同时提到「删除」和「生成预览」时按 danger）。
+H.classifyDialog = function (text) {
+  var t = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  if (!t) return 'none';
+  if (/(删除|移除|回收站|清空|永久|格式化|注销|退出登录|登出|卸载|delete|remove|recycle|wipe|sign out|log out|uninstall)/i.test(t)) return 'danger';
+  if (t.indexOf('生成预览') >= 0 && /(最多可以新增|每个空间最多|待处理预览任务|超过)/.test(t)) return 'quota';
+  return 'other';
 };
 
+// 可见对话框的候选选择器（页面改版时改这里；判可见一律走 vis()）
+H.DIALOG_SEL = '[role="dialog"],[role="alertdialog"],.ReactModal__Content,.synofoto-dialog,.synofoto-message-dialog';
+
+H.dialogTexts = async function () {
+  var r = null;
+  try {
+    r = await H.G(() => H.PW().locator('body').evaluate(function () {
+      var vis = function (el) {
+        if (!el) return false;
+        var b = el.getBoundingClientRect();
+        if (!(b.width > 10 && b.height > 10)) return false;
+        var cs = window.getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+        if (Number(cs.opacity) === 0) return false;
+        return true;
+      };
+      // ReactModal 的 overlay 隐藏（display:none）时里面的 Content 也可能还留着尺寸，要一起查祖先
+      var ancHidden = function (el) {
+        var p = el.parentElement, hops = 0;
+        while (p && hops++ < 8) {
+          if (/ReactModal__Overlay|modal-mask|mask/.test(String(p.className || '')) && !vis(p)) return true;
+          p = p.parentElement;
+        }
+        return false;
+      };
+      var sel = '[role="dialog"],[role="alertdialog"],.ReactModal__Content,.synofoto-dialog,.synofoto-message-dialog';
+      var nodes = document.querySelectorAll(sel), out = [];
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (!vis(el) || ancHidden(el)) continue;
+        var t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t) out.push(t.slice(0, 400));
+      }
+      return out;
+    }));
+  } catch (e) { return []; }
+  return Array.isArray(r) ? r : [];
+};
+
+// 回报页面上「真正可见」的弹窗分类：{kind:'none'|'danger'|'quota'|'other', texts:[...]}
+// danger 永远优先 —— 宁可整批不提交，也绝不让代码碰到删除/回收站确认框。
+H.visibleDialog = async function () {
+  var ts = await H.dialogTexts();
+  var kinds = ts.map(H.classifyDialog);
+  var pick = function (k) { return kinds.indexOf(k) >= 0 ? k : null; };
+  var kind = pick('danger') || pick('quota') || pick('other') || 'none';
+  return { kind: kind, texts: ts };
+};
+
+// 提交前的最后一道闸。other 与 danger 同样拦：正常跑批期间页面不该有弹窗，判不准就当有危险。
+// 传输层报错时 dialogTexts 返回 []（放行）—— 真弹窗挡着的话后面的点击本来就落不下去。
+H.dialogGate = async function () {
+  var d = await H.visibleDialog();
+  if (d.kind === 'danger' || d.kind === 'other') return { ok: false, kind: d.kind, texts: d.texts };
+  return { ok: true, kind: d.kind, texts: d.texts };
+};
+
+// 兼容老调用点：只有「配额弹窗」才算挡住提交的弹窗；danger/other 由 H.dialogGate 负责拦。
+H.dialogOpen = async function () { return (await H.visibleDialog()).kind === 'quota'; };
+
+// 只关配额弹窗：确定按钮必须位于「文案命中 quota 的那个可见对话框」内部。
+// danger / other / 找不到 → 一个按钮都不碰，返回 {kind, clicked:false} 让上层停机回报。
 H.dismissDialog = async function () {
-  await H.G(() => H.PW().locator('body').evaluate(function () {
-    var bs = document.querySelectorAll('button');
-    for (var i = 0; i < bs.length; i++) if (String(bs[i].textContent).trim() === '确定') { bs[i].click(); return true; }
-    return false;
-  })).catch(() => {});
+  var d = await H.visibleDialog();
+  if (d.kind !== 'quota') return { kind: d.kind, clicked: false };
+  var src = '(function(){ var want=' + JSON.stringify(d.texts) + ';'
+    + 'var vis=function(el){ if(!el)return false; var b=el.getBoundingClientRect();'
+    + ' if(!(b.width>10&&b.height>10))return false; var cs=window.getComputedStyle(el);'
+    + ' return !(cs.display==="none"||cs.visibility==="hidden"||Number(cs.opacity)===0); };'
+    + 'var sel=' + JSON.stringify(H.DIALOG_SEL) + ';'
+    + 'var ds=document.querySelectorAll(sel);'
+    + 'for(var i=0;i<ds.length;i++){ var el=ds[i]; if(!vis(el))continue;'
+    + ' var t=String(el.textContent||"").replace(/\\s+/g," ").trim().slice(0,400);'
+    + ' if(want.indexOf(t)<0)continue;'
+    + ' var bs=el.querySelectorAll("button");'
+    + ' for(var k=0;k<bs.length;k++){ var x=String(bs[k].textContent||"").replace(/\\s+/g,"").trim();'
+    + '  if(x==="确定"||x==="OK"||x==="Ok"||x==="ok"){ bs[k].click(); return true; } }'
+    + '}'
+    + 'return false; })';
+  var clicked = false;
+  try { clicked = !!(await H.G(() => H.PW().locator('body').evaluate(src))); } catch (e) { clicked = false; }
+  return { kind: d.kind, clicked: clicked };
+};
+
+// 关掉可能残留的右键菜单。合成 contextmenu 关不掉（实测），Playwright 的 Escape 能；
+// 吞错 —— 关不掉也不该打断提交判定，但调用点必须已经决定不再往这块区域点。
+H.dismissMenu = async function () {
+  try { await H.G(() => H.PW().locator('body').press('Escape')); } catch (e) {}
+  await H.sleep(250);
 };
 // 一次快照取全部判据：6 次 locator.count 在这个 shim 里太慢，而且要与 pumpX2 的判读源保持一致。
 // loaded 才是「预览真的生成完」的信号；bad/nosrc 在点完「生成预览」的同一秒就会归零。
@@ -455,14 +553,23 @@ H.genPreview2 = async function (ps) {
     if (tbBad1 >= 0 && tbBad1 < idxs.length) return { ok: true, via: 'toolbar', dialog: false };
   }
   var tryIdx = [idxs[0], idxs[idxs.length - 1], idxs[Math.floor(idxs.length / 2)]];
+  // 慢路要真的右键点卡片：屏幕上若挂着认不出来的弹窗（非配额），先停下来，别往那块区域点
+  if (tb === 'clicked') {
+    var g0 = await H.dialogGate();
+    if (!g0.ok) return { ok: false, reason: 'dialog-blocking', kind: g0.kind };
+  }
   for (var j = 0; j < tryIdx.length; j++) {
+    // 上一轮可能留下没提交成的右键菜单，先关掉再点 —— 菜单第一项是「删除」，
+    // 「残留菜单 + 下一次 scrollIntoView/click」就是莫名弹出删除框的候选路径（2026-11-12）。
+    if (j > 0) await H.dismissMenu();
     var t = g.nth(tryIdx[j]);
     await H.G(() => t.scrollIntoViewIfNeeded()).catch(() => {});
     await H.G(() => t.click({ button: 'right', force: true, timeout: 5000 })).catch(() => {});
     await H.sleep(900);
     var mi = await H.menuInfo().catch(() => null);
     if (!mi || !mi.open) continue;                       // x=-50000 表示菜单被 parked，等于没打开
-    if (!mi.hasGen) continue;
+    // 菜单里没有「生成预览」＝这不是能提交的卡片（目录封面/其它类型）：关掉，绝不留给下一次点击
+    if (!mi.hasGen) { await H.dismissMenu(); continue; }
     var badBefore = await H.brokenCount().catch(() => -1);
     await H.clickGen().catch(() => 'err');
     await H.sleep(900);
@@ -482,6 +589,7 @@ H.genPreview2 = async function (ps) {
     }
     return { ok: true, via: 'menu', usedIndex: tryIdx[j], dialog: false };
   }
+  await H.dismissMenu();   // 三次都没打开可用菜单：别把残留菜单留给上层的下一次点击/翻页
   return { ok: false, reason: 'no-menu' };
 };
 
@@ -837,6 +945,15 @@ H.pumpX2 = async function (id, budgetMs, opts) {
       attempt++;
       var bi = badNew(ps);
       if (!bi.length) { windowDone = true; break; }
+      // 弹窗闸（2026-11-12）：即将往卡片上点选/右键了，页面上却挂着认不出的对话框 ⇒ 一张都不点。
+      // 放在「确认这批有坏图要提交」之后：干净目录不花这一趟往返；每批一次，中途弹出来的也拦得住。
+      var dg = await H.dialogGate();
+      if (!dg.ok) {
+        blocked = 'dialog-blocking';
+        push('dialog ' + dg.kind + ' ' + String((dg.texts || [])[0] || '').slice(0, 60));
+        rec({ dialog: dg.kind, dialogText: String((dg.texts || [])[0] || '').slice(0, 160) });
+        windowDone = true; break;
+      }
       var k = Math.min(bi.length, cap), f0 = bi[0], last = Math.min(bi[k - 1], ps.length - 1);
       var got = await H.selSpan3(f0, last); batches++;
       push('sel ' + got + ' bad=' + bi.length + ' win=' + w);
@@ -862,7 +979,8 @@ H.pumpX2 = async function (id, budgetMs, opts) {
       await H.clearSel();
       ps = H.parse(await H.snap());   // 同窗口可能还剩超出 cap 的坏图，继续下一批
     }
-    if (blocked === 'sel-fail') break;
+    // sel-fail 与 dialog-blocking：整目录别再往下翻（前者会重复失败，后者绝不许在弹窗上继续点）
+    if (blocked === 'sel-fail' || blocked === 'dialog-blocking' || String(blocked || '').indexOf('gp-dialog') === 0) break;
     if (w === maxWin) break;
     await H.pageDown();
     var p2 = H.parse(await H.snap());
@@ -891,7 +1009,7 @@ H.workerX2 = async function (deadlineMs) {
     out.push([r.id, r.total, r.sent || 0, r.batches || 0, r.quota || 0, r.stillBadWindow === undefined ? '?' : r.stillBadWindow, (r.blocked || r.err || (r.clean ? 'clean' : 'ok'))].join('/'));
     quotaStreak = (r.blocked === 'quota') ? quotaStreak + 1 : 0;
     await H.persist('worker');
-    var bad = !!r.err || r.blocked === 'quota' || r.blocked === 'budget' || r.blocked === 'stuck-window' || r.blocked === 'not-rendered' || String(r.blocked || '').indexOf('gp-') === 0;
+    var bad = !!r.err || r.blocked === 'quota' || r.blocked === 'budget' || r.blocked === 'stuck-window' || r.blocked === 'not-rendered' || r.blocked === 'dialog-blocking' || String(r.blocked || '').indexOf('gp-') === 0;
     if (bad) L.retry[id] = (L.retry[id] || 0) + 1;
     if (bad && L.retry[id] <= 3) L.vQueue.push(L.vQueue.shift()); else L.vQueue.shift();
     if (quotaStreak >= 2) {   // 整个空间的队列满了，小批量继续提交只会撞配额
